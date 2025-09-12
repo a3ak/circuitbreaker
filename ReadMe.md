@@ -109,7 +109,3 @@ if cb.Allow() {
 - **Closed** — all requests are allowed.
 - **Open** — all requests are blocked.
 - **Half-Open** — some requests are allowed to test recovery.
-
----
-
-> Переключайте язык с помощью ссылок в
