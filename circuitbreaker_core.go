@@ -1,38 +1,41 @@
+// Circuit Breaker паттерн для управления отказами в распределенных системах.
+// Используется для предотвращения повторных неудачных запросов к сервисам, которые могут быть временно недоступны.
+// Позволяет снизить нагрузку на проблемные сервисы.
+// Имеет три состояния:
+//
+//						closed(замкнутое состояние, когда запросы пропускаются к сервису),
+//	 					open (разомкнутое состо]ние, когда запросы не пропускаются к проблемному сервису)
+//						half-open(частично разомкнутое состояние, когда часть запросов пропускается для проверки доступности сервиса).
 package circuitbreaker
 
 import (
+	"errors"
 	"math/rand/v2"
 	"sync"
 	"time"
-
-	"github.com/nir0k/logger"
 )
 
 // Структура для конфигурации Circuit Breaker
 type CircuitBreakerConf struct {
-	FailureThreshold int           `yaml:"failure_threshold"`
-	RecoveryTimeout  time.Duration `yaml:"recovery_timeout"`
-	SuccessThreshold int           `yaml:"success_threshold"`
-	HalfOpenPrc      int           `yaml:"half_open_prc"` // Процент пропускаемых запросов
+	FailureThreshold int           `yaml:"failure_threshold"` // Количество неудач до срабатывания
+	RecoveryTimeout  time.Duration `yaml:"recovery_timeout"`  // Время до попытки восстановления
+	SuccessThreshold int           `yaml:"success_threshold"` // Количество успешных запросов для восстановления
+	HalfOpenPrc      int           `yaml:"half_open_prc"`     // Процент пропускаемых запросов
 }
 
 // State представляет состояние Circuit Breaker
-type State int
+type State uint8
 
 // Возможные состояния
 const (
-	StateClosed State = iota
-	StateOpen
-	StateHalfOpen
+	stateClosed State = iota
+	stateOpen
+	stateHalfOpen
+	notConfigured
 )
 
-var (
-	CircuitBreakers   map[string]*CircuitBreaker
-	circuitBreakersMu sync.RWMutex
-)
-
-// CircuitBreaker реализует паттерн Circuit Breaker
-type CircuitBreaker struct {
+// circuitBreaker реализует паттерн Circuit Breaker
+type circuitBreaker struct {
 	mu               sync.RWMutex
 	state            State
 	failureCount     int
@@ -47,13 +50,22 @@ type CircuitBreaker struct {
 }
 
 // New создает новый Circuit Breaker
-func New(name string, config CircuitBreakerConf) *CircuitBreaker {
-	if config.SuccessThreshold == 0 {
+func new(name string, config CircuitBreakerConf) (*circuitBreaker, error) {
+	if name == "" {
+		return nil, errors.New("circuit breaker name cannot be empty")
+	}
+
+	// Установка значений по умолчанию, если не заданы или заданы некорректно
+	if config.SuccessThreshold <= 0 {
 		config.SuccessThreshold = 3
 	}
 
-	if config.RecoveryTimeout == 0 {
+	if config.RecoveryTimeout <= 0 {
 		config.RecoveryTimeout = 30 * time.Second
+	}
+
+	if config.FailureThreshold <= 0 {
+		config.FailureThreshold = 5
 	}
 
 	if config.HalfOpenPrc <= 0 {
@@ -62,104 +74,105 @@ func New(name string, config CircuitBreakerConf) *CircuitBreaker {
 		config.HalfOpenPrc = 100
 	}
 
-	return &CircuitBreaker{
-		state:            StateClosed,
+	return &circuitBreaker{
+		state:            stateClosed,
 		failureThreshold: config.FailureThreshold,
 		recoveryTimeout:  config.RecoveryTimeout,
 		successThreshold: config.SuccessThreshold,
 		name:             name,
 		halfOpenPrc:      config.HalfOpenPrc,
-	}
+	}, nil
 }
 
 // Allow проверяет, разрешено ли выполнение запроса
-func (cb *CircuitBreaker) Allow() bool {
+func (cb *circuitBreaker) allow() (bool, State) {
 	cb.mu.RLock()
 	state := cb.state
 	lastFailureTime := cb.lastFailureTime
 	recoveryTimeout := cb.recoveryTimeout
 	halfOpenPrc := cb.halfOpenPrc
-	name := cb.name
+	//name := cb.name
 	cb.mu.RUnlock()
 
 	switch state {
-	case StateClosed:
-		return true
-	case StateHalfOpen:
-		return rand.IntN(100) < halfOpenPrc
-	case StateOpen:
+	case stateClosed:
+		return true, state
+	case stateHalfOpen:
+		return rand.IntN(100) < halfOpenPrc, state
+	case stateOpen:
 		if time.Since(lastFailureTime) >= recoveryTimeout {
 			cb.mu.Lock()
+			defer cb.mu.Unlock()
 			// Повторная проверка, чтобы избежать гонки
-			if cb.state == StateOpen && time.Since(cb.lastFailureTime) >= cb.recoveryTimeout {
-				cb.state = StateHalfOpen
-				logger.Infof("Circuit breaker %s moved to half-open state", name)
+			if cb.state == stateOpen && time.Since(cb.lastFailureTime) >= cb.recoveryTimeout {
+				cb.state = stateHalfOpen
 			}
-			cb.mu.Unlock()
+
 			// В half-open состоянии пропускаем только часть запросов
-			return rand.IntN(100) < halfOpenPrc
+			return rand.IntN(100) < halfOpenPrc, stateHalfOpen
 		}
-		return false
+		return false, state
 	default:
-		return false
+		return false, state
 	}
 }
 
 // Success отмечает успешное выполнение запроса
-func (cb *CircuitBreaker) Success() {
+func (cb *circuitBreaker) success() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	switch cb.state {
-	case StateClosed:
+	case stateClosed:
 		// Декрементируем счетчик ошибок при успешных запросах
 		if cb.failureCount > 0 {
 			cb.failureCount--
 		}
-	case StateHalfOpen:
+	case stateHalfOpen:
+		// В half-open состоянии считаем успешные запросы
 		cb.successCount++
+		// Если достигнут порог успешных запросов, переходим в closed
 		if cb.successCount >= cb.successThreshold {
-			cb.state = StateClosed
+			cb.state = stateClosed
 			cb.failureCount = 0
 			cb.successCount = 0
-			logger.Infof("Circuit breaker %s moved to closed state", cb.name)
 			cb.transaction++
 		}
 	}
 }
 
 // Failure отмечает неудачное выполнение запроса
-func (cb *CircuitBreaker) Failure() {
+func (cb *circuitBreaker) failure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	switch cb.state {
-	case StateClosed:
+	case stateClosed:
 		cb.failureCount++
+		// Если достигнут порог ошибок, переходим в open
 		if cb.failureCount >= cb.failureThreshold {
-			cb.state = StateOpen
+			cb.state = stateOpen
 			cb.lastFailureTime = time.Now()
-			logger.Warningf("Circuit breaker %s tripped to open state", cb.name)
+			//Инициализируем счетчики переходов состояний
 			cb.transaction++
 		}
-	case StateHalfOpen:
+	case stateHalfOpen:
 		// В half-open состоянии любая ошибка возвращает в open
-		cb.state = StateOpen
+		cb.state = stateOpen
 		cb.lastFailureTime = time.Now()
 		cb.successCount = 0
-		logger.Warningf("Circuit breaker %s moved back to open state", cb.name)
 	}
 }
 
 // State возвращает текущее состояние
-func (cb *CircuitBreaker) State() State {
+func (cb *circuitBreaker) curState() State {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	return cb.state
 }
 
 // Stats возвращает статистику
-func (cb *CircuitBreaker) Stats() map[string]any {
+func (cb *circuitBreaker) stats() map[string]any {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 
@@ -176,12 +189,14 @@ func (cb *CircuitBreaker) Stats() map[string]any {
 // String возвращает текстовое представление состояния
 func (s State) String() string {
 	switch s {
-	case StateClosed:
+	case stateClosed:
 		return "closed"
-	case StateOpen:
+	case stateOpen:
 		return "open"
-	case StateHalfOpen:
+	case stateHalfOpen:
 		return "half-open"
+	case notConfigured:
+		return "not configured"
 	default:
 		return "unknown"
 	}

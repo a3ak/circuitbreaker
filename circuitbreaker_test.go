@@ -16,17 +16,19 @@ func TestInitCircuitBreakers(t *testing.T) {
 		HalfOpenPrc:      30,
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
 
-	circuitBreakersMu.RLock()
-	defer circuitBreakersMu.RUnlock()
+	m.InitCircuitBreakers(servers, cfg)
 
-	if len(CircuitBreakers) != len(servers) {
-		t.Errorf("Expected %d circuit breakers, got %d", len(servers), len(CircuitBreakers))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(m.breakers) != len(servers) {
+		t.Errorf("Expected %d circuit breakers, got %d", len(servers), len(m.breakers))
 	}
 
 	for _, server := range servers {
-		if cb, exists := CircuitBreakers[server]; !exists || cb == nil {
+		if cb, exists := m.breakers[server]; !exists || cb == nil {
 			t.Errorf("Circuit breaker for server %s not found or is nil", server)
 		}
 	}
@@ -39,16 +41,18 @@ func TestGetCircuitBreaker(t *testing.T) {
 		RecoveryTimeout:  5 * time.Second,
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
+	m.InitCircuitBreakers(servers, cfg)
 
 	// Тест существующего сервера
-	cb := GetCircuitBreaker("test-server")
+	cb := m.GetCircuitBreaker("test-server")
+
 	if cb == nil {
 		t.Error("Expected circuit breaker, got nil")
 	}
 
 	// Тест несуществующего сервера
-	cb = GetCircuitBreaker("non-existent-server")
+	cb = m.GetCircuitBreaker("non-existent-server")
 	if cb != nil {
 		t.Error("Expected nil for non-existent server")
 	}
@@ -63,27 +67,29 @@ func TestAllowRequest(t *testing.T) {
 		HalfOpenPrc:      100, // 100% для предсказуемости тестов
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
+
+	m.InitCircuitBreakers(servers, cfg)
 
 	// Тест: CB не настроен для сервера (должен разрешить запрос)
-	allowed := AllowRequest("unknown-server")
+	allowed, _ := m.AllowRequest("unknown-server")
 	if !allowed {
 		t.Error("Expected allowed request for server without CB")
 	}
 
 	// Тест: CB в закрытом состоянии (должен разрешить запрос)
-	allowed = AllowRequest("test-server")
+	allowed, _ = m.AllowRequest("test-server")
 	if !allowed {
 		t.Error("Expected allowed request for closed CB")
 	}
 
 	// Переводим CB в открытое состояние
 	for i := 0; i < cfg.FailureThreshold; i++ {
-		ReportFailure("test-server")
+		m.ReportFailure("test-server")
 	}
 
 	// Тест: CB в открытом состоянии (должен запретить запрос)
-	allowed = AllowRequest("test-server")
+	allowed, _ = m.AllowRequest("test-server")
 	if allowed {
 		t.Error("Expected denied request for open CB")
 	}
@@ -92,7 +98,7 @@ func TestAllowRequest(t *testing.T) {
 	time.Sleep(cfg.RecoveryTimeout + 50*time.Millisecond)
 
 	// Тест: CB перешел в half-open после таймаута
-	allowed = AllowRequest("test-server")
+	allowed, _ = m.AllowRequest("test-server")
 	if !allowed {
 		t.Error("Expected allowed request for half-open CB")
 	}
@@ -108,25 +114,27 @@ func TestReportSuccess(t *testing.T) {
 		HalfOpenPrc:      100,
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
+
+	m.InitCircuitBreakers(servers, cfg)
 
 	// Переводим CB в half-open состояние
-	ReportFailure("test-server") // failureCount = 1 → open
+	m.ReportFailure("test-server") // failureCount = 1 → open
 	time.Sleep(110 * time.Millisecond)
-	AllowRequest("test-server") // Переводит в half-open
+	_, _ = m.AllowRequest("test-server") // Переводит в half-open
 
 	// Сообщаем об успехах
-	ReportSuccess("test-server") // successCount = 1
-	ReportSuccess("test-server") // successCount = 2 → closed
+	m.ReportSuccess("test-server") // successCount = 1
+	m.ReportSuccess("test-server") // successCount = 2 → closed
 
 	// Проверяем, что CB вернулся в closed состояние
-	cb := GetCircuitBreaker("test-server")
-	if cb.State() != StateClosed {
-		t.Errorf("Expected closed state, got %v", cb.State())
+	cb := m.GetCircuitBreaker("test-server")
+	if cb.curState() != stateClosed {
+		t.Errorf("Expected closed state, got %v", cb.curState())
 	}
 
 	// Тест: ReportSuccess для сервера без CB (не должно паниковать)
-	ReportSuccess("unknown-server")
+	m.ReportSuccess("unknown-server")
 }
 
 func TestReportFailure(t *testing.T) {
@@ -138,31 +146,33 @@ func TestReportFailure(t *testing.T) {
 		HalfOpenPrc:      100,
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
+
+	m.InitCircuitBreakers(servers, cfg)
 
 	// Сообщаем о неудачах
-	ReportFailure("test-server") // failureCount = 1
-	if GetCircuitBreaker("test-server").State() != StateClosed {
+	m.ReportFailure("test-server") // failureCount = 1
+	if m.GetCircuitBreaker("test-server").curState() != stateClosed {
 		t.Error("Expected closed state after first failure")
 	}
 
-	ReportFailure("test-server") // failureCount = 2 → open
-	if GetCircuitBreaker("test-server").State() != StateOpen {
+	m.ReportFailure("test-server") // failureCount = 2 → open
+	if m.GetCircuitBreaker("test-server").curState() != stateOpen {
 		t.Error("Expected open state after threshold failures")
 	}
 
 	// Переводим в half-open
 	time.Sleep(110 * time.Millisecond)
-	AllowRequest("test-server")
+	_, _ = m.AllowRequest("test-server")
 
 	// Неудача в half-open возвращает в open
-	ReportFailure("test-server")
-	if GetCircuitBreaker("test-server").State() != StateOpen {
+	m.ReportFailure("test-server")
+	if m.GetCircuitBreaker("test-server").curState() != stateOpen {
 		t.Error("Expected open state after failure in half-open")
 	}
 
 	// Тест: ReportFailure для сервера без CB (не должно паниковать)
-	ReportFailure("unknown-server")
+	m.ReportFailure("unknown-server")
 }
 
 func TestGetCircuitBreakerStats(t *testing.T) {
@@ -172,9 +182,10 @@ func TestGetCircuitBreakerStats(t *testing.T) {
 		RecoveryTimeout:  30 * time.Second,
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
+	m.InitCircuitBreakers(servers, cfg)
 
-	stats := GetCircuitBreakerStats()
+	stats := m.GetCircuitBreakerStats()
 
 	if len(stats) != len(servers) {
 		t.Errorf("Expected stats for %d servers, got %d", len(servers), len(stats))
@@ -199,31 +210,32 @@ func TestGetCircuitBreakerState(t *testing.T) {
 		RecoveryTimeout:  100 * time.Millisecond,
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
+	m.InitCircuitBreakers(servers, cfg)
 
 	// Тест: сервер без CB
-	state := GetCircuitBreakerState("unknown-server")
+	state := m.GetCircuitBreakerState("unknown-server")
 	if state != "disabled" {
 		t.Errorf("Expected 'disabled', got '%s'", state)
 	}
 
 	// Тест: закрытое состояние
-	state = GetCircuitBreakerState("test-server")
+	state = m.GetCircuitBreakerState("test-server")
 	if state != "closed" {
 		t.Errorf("Expected 'closed', got '%s'", state)
 	}
 
 	// Тест: открытое состояние
-	ReportFailure("test-server")
-	state = GetCircuitBreakerState("test-server")
+	m.ReportFailure("test-server")
+	state = m.GetCircuitBreakerState("test-server")
 	if state != "open" {
 		t.Errorf("Expected 'open', got '%s'", state)
 	}
 
 	// Тест: half-open состояние
 	time.Sleep(110 * time.Millisecond)
-	AllowRequest("test-server") // Переводит в half-open
-	state = GetCircuitBreakerState("test-server")
+	_, _ = m.AllowRequest("test-server") // Переводит в half-open
+	state = m.GetCircuitBreakerState("test-server")
 	if state != "half-open" {
 		t.Errorf("Expected 'half-open', got '%s'", state)
 	}
@@ -237,7 +249,9 @@ func TestConcurrentAccess(t *testing.T) {
 		HalfOpenPrc:      50,
 	}
 
-	InitCircuitBreakers(servers, cfg)
+	m := NewCBManager()
+
+	m.InitCircuitBreakers(servers, cfg)
 
 	var wg sync.WaitGroup
 	iterations := 100
@@ -250,44 +264,45 @@ func TestConcurrentAccess(t *testing.T) {
 
 			// Чередуем успешные и неуспешные запросы
 			if iteration%2 == 0 {
-				allowed := AllowRequest("concurrent-server")
+				allowed, _ := m.AllowRequest("concurrent-server")
 				if allowed {
-					ReportSuccess("concurrent-server")
+					m.ReportSuccess("concurrent-server")
 				}
 			} else {
-				allowed := AllowRequest("concurrent-server")
+				allowed, _ := m.AllowRequest("concurrent-server")
 				if allowed {
-					ReportFailure("concurrent-server")
+					m.ReportFailure("concurrent-server")
 				}
 			}
 
 			// Читаем состояние
-			_ = GetCircuitBreakerState("concurrent-server")
-			_ = GetCircuitBreakerStats()
+			_ = m.GetCircuitBreakerState("concurrent-server")
+			_ = m.GetCircuitBreakerStats()
 		}(i)
 	}
 
 	wg.Wait()
 
 	// После всех операций CB должен быть в валидном состоянии
-	cb := GetCircuitBreaker("concurrent-server")
-	state := cb.State()
-	if state != StateClosed && state != StateOpen && state != StateHalfOpen {
+	cb := m.GetCircuitBreaker("concurrent-server")
+	state := cb.curState()
+	if state != stateClosed && state != stateOpen && state != stateHalfOpen {
 		t.Errorf("Invalid state after concurrent access: %v", state)
 	}
 }
 
 func TestEdgeCases(t *testing.T) {
 	// Тест: инициализация с пустым списком серверов
-	InitCircuitBreakers([]string{}, CircuitBreakerConf{})
-	stats := GetCircuitBreakerStats()
+	m := NewCBManager()
+	m.InitCircuitBreakers([]string{}, CircuitBreakerConf{})
+	stats := m.GetCircuitBreakerStats()
 	if len(stats) != 0 {
 		t.Error("Expected no circuit breakers for empty servers list")
 	}
 
 	// Тест: инициализация с nil конфигом
-	InitCircuitBreakers([]string{"test"}, CircuitBreakerConf{})
-	cb := GetCircuitBreaker("test")
+	m.InitCircuitBreakers([]string{"test"}, CircuitBreakerConf{})
+	cb := m.GetCircuitBreaker("test")
 	if cb == nil {
 		t.Error("Expected circuit breaker with default config")
 	}

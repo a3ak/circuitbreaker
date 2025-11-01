@@ -1,91 +1,114 @@
 package circuitbreaker
 
-import "github.com/nir0k/logger"
+import "sync"
+
+type CBManager struct {
+	breakers map[string]*circuitBreaker
+	mu       sync.RWMutex
+}
+
+// NewManager создает новый менеджер circuit breakers
+func NewCBManager() *CBManager {
+	return &CBManager{
+		breakers: make(map[string]*circuitBreaker),
+	}
+}
 
 // InitCircuitBreakers инициализирует Circuit Breakers для серверов
-func InitCircuitBreakers(servers []string, cfg CircuitBreakerConf) {
-	circuitBreakersMu.Lock()
-	defer circuitBreakersMu.Unlock()
-
-	CircuitBreakers = make(map[string]*CircuitBreaker)
+func (m *CBManager) InitCircuitBreakers(servers []string, cfg CircuitBreakerConf) (cbInitErr []error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	for _, srv := range servers {
-		cb := New(srv, cfg)
-		CircuitBreakers[srv] = cb
+		cb, err := new(srv, cfg)
+		if cb == nil && err != nil {
+			cbInitErr = append(cbInitErr, err)
+			continue
+		}
+		m.breakers[srv] = cb
 	}
+	return cbInitErr
 }
 
 // GetCircuitBreaker возвращает Circuit Breaker для сервера
-func GetCircuitBreaker(serverURL string) *CircuitBreaker {
-	circuitBreakersMu.RLock()
-	defer circuitBreakersMu.RUnlock()
+func (m *CBManager) GetCircuitBreaker(serverURL string) *circuitBreaker {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	return CircuitBreakers[serverURL]
+	return m.breakers[serverURL]
 }
 
 // AllowRequest проверяет, разрешен ли запрос к серверу
-func AllowRequest(serverURL string) bool {
-	cb := GetCircuitBreaker(serverURL)
+func (m *CBManager) AllowRequest(serverURL string) (bool, State) {
+	cb := m.GetCircuitBreaker(serverURL)
 	if cb == nil {
-		logger.Warningf("Circuit breaker not configured for %s, allowing request", serverURL)
-		return true // Если CB не настроен, разрешаем запрос
+		//logger.Warningf("Circuit breaker not configured for %s, allowing request", serverURL)
+		return true, notConfigured // Если CB не настроен, разрешаем запрос
 	}
+	return cb.allow()
 
-	allowed := cb.Allow()
-	state := cb.State()
+	/*
+		allowed := cb.Allow()
+		state := cb.State()
 
-	if state == StateHalfOpen {
-		logger.Debugf("Circuit breaker %s: half-open state, request allowed: %t",
-			serverURL, allowed)
-	}
+		if state == StateHalfOpen {
+			logger.Debugf("Circuit breaker %s: half-open state, request allowed: %t",
+				serverURL, allowed)
+		}
 
-	return allowed
+		return allowed
+	*/
 }
 
 // ReportSuccess отмечает успешный запрос
-func ReportSuccess(serverURL string) {
-	cb := GetCircuitBreaker(serverURL)
+func (m *CBManager) ReportSuccess(serverURL string) {
+	cb := m.GetCircuitBreaker(serverURL)
 	if cb != nil {
-		cb.Success()
+		cb.success()
 	}
 }
 
 // ReportFailure отмечает неудачный запрос
-func ReportFailure(serverURL string) {
-	cb := GetCircuitBreaker(serverURL)
+func (m *CBManager) ReportFailure(serverURL string) {
+	cb := m.GetCircuitBreaker(serverURL)
 	if cb != nil {
-		cb.Failure()
+		cb.failure()
 	}
 }
 
 // GetCircuitBreakerStats возвращает статистику всех Circuit Breakers
-func GetCircuitBreakerStats() map[string]any {
-	circuitBreakersMu.RLock()
-	defer circuitBreakersMu.RUnlock()
+func (m *CBManager) GetCircuitBreakerStats() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	stats := make(map[string]any)
-	for srv, cb := range CircuitBreakers {
-		stats[srv] = cb.Stats()
+	for srv, cb := range m.breakers {
+		stats[srv] = cb.stats()
 	}
 	return stats
 }
 
 // GetCircuitBreakerstate возвращает текстовое состояние Circuit Breaker
-func GetCircuitBreakerState(serverURL string) string {
-	cb := GetCircuitBreaker(serverURL)
+func (m *CBManager) GetCircuitBreakerState(serverURL string) string {
+	cb := m.GetCircuitBreaker(serverURL)
 	if cb == nil {
 		return "disabled"
 	}
+	return cb.curState().String()
+	/*
+		state := cb.curState()
+		switch state {
+		case stateClosed:
+			return "closed"
+		case stateOpen:
+			return "open"
+		case stateHalfOpen:
+			return "half-open"
+		case notConfigured:
+			return "not configured"
+		default:
+			return "unknown"
+		}
 
-	state := cb.State()
-	switch state {
-	case StateClosed:
-		return "closed"
-	case StateOpen:
-		return "open"
-	case StateHalfOpen:
-		return "half-open"
-	default:
-		return "unknown"
-	}
+	*/
 }
